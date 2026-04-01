@@ -122,6 +122,18 @@ def test_configs_as_generator_works(tmp_path, monkeypatch):
     assert fn(jnp.ones(4), N=4).shape == (4,)
 
 
+def test_key_param_without_default_raises_at_decoration():
+    """Key param declared in fn without a default → clear TypeError at decoration time.
+
+    Without this check the sweep silently fails with a cryptic
+    'missing required keyword-only argument' from inside jitted_fn.lower().
+    """
+    with pytest.raises(TypeError, match="has no default"):
+        @autotune(configs=[KC(1)], key=["N"])
+        def fn(cfg: KC, x: jax.Array, *, N: int) -> jax.Array:  # type: ignore[misc]
+            return x * cfg.scale
+
+
 def test_heterogeneous_configs_raises():
     """Configs with different pytree structures → ValueError at decoration time."""
     class KCA(NamedTuple):

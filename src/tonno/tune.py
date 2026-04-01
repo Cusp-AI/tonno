@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import inspect
 import time
 from collections.abc import Callable, Hashable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -94,6 +95,20 @@ def autotune(
         fn: Callable[Concatenate[_C, _P], _R],
     ) -> Callable[_P, _R]:
         fn_name = fn.__qualname__
+
+        # Validate that any key param declared in fn has a default.
+        # Key params are popped before fn is called, so a required (no-default)
+        # key param causes a cryptic "missing keyword argument" error in the sweep.
+        sig = inspect.signature(fn)
+        for k in key:
+            param = sig.parameters.get(k)
+            if param is not None and param.default is inspect.Parameter.empty:
+                raise TypeError(
+                    f"key parameter {k!r} in {fn.__qualname__!r} has no default. "
+                    f"Autotune pops key params before calling fn, so they are never "
+                    f"forwarded — add a default: {k}: ... = None"
+                )
+
         # The config is the first positional arg and is static (static_argnums=0).
         # Because configs are hashable, JAX produces one compiled artifact per unique
         # config — exactly what Pallas kernels need (cfg.bm / cfg.bk determine the grid).
