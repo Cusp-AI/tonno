@@ -9,5 +9,12 @@ wheels/
 # Virtual environments
 .venv
 
+# Test / tool caches
+.pytest_cache/
+.pyright/
+
+# Scratch
+*.ipynb
+
 # Tonno cache
 .tonno-cache/
