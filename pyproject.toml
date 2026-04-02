@@ -3,8 +3,23 @@ name = "tonno"
 version = "0.1.0"
 description = "Autotuning for JAX/Pallas kernels"
 readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Jonas Köhler", email = "jonas@cusp.ai" }]
 requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
 dependencies = ["jax"]
+
+[project.urls]
+Homepage = "https://github.com/jonkhler/tonno"
+Repository = "https://github.com/jonkhler/tonno"
+Issues = "https://github.com/jonkhler/tonno/issues"
 
 [build-system]
 requires = ["uv_build>=0.10.4,<0.11.0"]
