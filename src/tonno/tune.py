@@ -6,9 +6,9 @@ from __future__ import annotations
 import functools
 import inspect
 import time
-from collections.abc import Callable, Hashable, Iterable, Sequence
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Concatenate, ParamSpec, TypeVar
+from typing import Any, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -17,55 +17,69 @@ from tonno import cache as _cache
 from tonno.cache import MISSING
 from tonno.hardware import get_device_name
 
-_C = TypeVar("_C", bound=Hashable)
-_P = ParamSpec("_P")
-_R = TypeVar("_R")
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _make_cache_key(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    tunable_names: frozenset[str],
+) -> dict[str, Any]:
+    """Derive a JSON-serialisable cache key from non-tunable arguments.
+
+    Arrays are keyed by (shape, dtype) — the same information jax.jit uses to
+    decide whether to recompile.  All other values are included as-is.
+    """
+    key: dict[str, Any] = {}
+    for i, a in enumerate(args):
+        if hasattr(a, "shape") and hasattr(a, "dtype"):
+            key[f"__arg{i}"] = {"shape": list(a.shape), "dtype": str(a.dtype)}
+        else:
+            key[f"__arg{i}"] = a
+    for k, v in sorted(kwargs.items()):
+        if k in tunable_names:
+            continue
+        if hasattr(v, "shape") and hasattr(v, "dtype"):
+            key[k] = {"shape": list(v.shape), "dtype": str(v.dtype)}
+        else:
+            key[k] = v
+    return key
 
 
 def autotune(
-    configs: Iterable[_C],
-    key: Sequence[str],
+    configs: list[dict[str, Any]],
     *,
     num_warmup: int = 1,
     num_timing: int = 3,
-    encode: Callable[[_C], Any] | None = None,
-    decode: Callable[[Any], _C] | None = None,
-) -> Callable[[Callable[Concatenate[_C, _P], _R]], Callable[_P, _R]]:
-    """Decorator that automates finding the best config for a JAX/Pallas function.
+) -> Callable[[_F], _F]:
+    """Sweep block-size configs on a ``jax.jit``-wrapped function and cache the best.
 
-    The decorated function must accept a config as its first positional argument.
-    Autotune injects the best config at call time; callers never pass it.
+    Stack ``@autotune`` on top of ``@jax.jit``.  The tunable parameters (the
+    keys of each config dict) must be declared as ``static_argnames`` in the
+    ``jax.jit`` call and must have defaults in the function signature — autotune
+    injects the best values at call time, callers never pass them.
 
-    ``NamedTuple`` is the recommended config type: it is hashable, fully typed,
-    and JSON-serialisable out of the box (json encodes tuples as lists; the
-    default decoder reconstructs via ``cfg_type(*loaded_list)``).  For types
-    that are not JSON-serialisable by default, supply ``encode`` and ``decode``.
+    The cache key is derived automatically from the non-tunable arguments using
+    the same logic as ``jax.jit``: arrays are identified by ``(shape, dtype)``,
+    all other static args by their value.  No explicit ``key=`` is needed.
 
     Example::
 
-        class KC(NamedTuple):
-            bm: int
-            bk: int
+        @autotune(configs=[{"BN": 32, "BK": 64}, {"BN": 64, "BK": 128}])
+        @jax.jit(static_argnames=["BN", "BK"])
+        def matmul(x: Array, w: Array, BN: int = 32, BK: int = 64) -> Array:
+            return pallas_matmul(x, w, BN=BN, BK=BK)
 
-        @autotune(configs=[KC(32, 64), KC(64, 32)], key=["N"])
-        def kernel(cfg: KC, x, *, N=None):
-            return x * cfg.bm  # cfg.bm: int — fully typed
+        matmul(x, w)                # BN/BK swept once, best config cached
+        matmul(x, w, BN=16, BK=32)  # explicit override, autotune bypassed
 
     Args:
-        configs: Configs to sweep.  Must be hashable (required by JAX's
-                 ``static_argnums``) and share the same pytree structure.
-        key: Names of kwargs that identify the problem shape.  Must be
-             passed by the caller; used as the cache key.
-        num_warmup: Warmup iterations before timing.
-        num_timing: Timed iterations per config; median is used.
-        encode: Converts a config to a JSON-serialisable value for the cache.
-                Defaults to identity — works for NamedTuple/tuple and any type
-                that json can serialise directly.
-        decode: Reconstructs a config from the json-loaded value.  Defaults to
-                ``cfg_type(*data)`` for list data (covers NamedTuple/tuple) or
-                ``cfg_type(**data)`` for dict data.
+        configs: Non-empty list of dicts mapping tunable kwarg names to candidate
+                 values.  All dicts must have identical keys.  Values must be
+                 JSON-serialisable (int, float, str, bool).
+        num_warmup: Warmup calls per config after compilation.  Default 1.
+        num_timing: Timed calls per config; median elapsed time is used.  Default 3.
     """
-    configs = list(configs)
     if not configs:
         raise ValueError("configs must not be empty")
     if num_timing < 1:
@@ -73,135 +87,106 @@ def autotune(
     if num_warmup < 0:
         raise ValueError(f"num_warmup must be >= 0, got {num_warmup}")
 
-    # All configs must share the same pytree structure so they produce comparable
-    # compiled artifacts (same input/output shapes) and can be fairly timed.
-    ref_structure = jax.tree.structure(configs[0])
+    ref_keys = frozenset(configs[0].keys())
+    if not ref_keys:
+        raise ValueError("config dicts must not be empty")
     for i, cfg in enumerate(configs[1:], 1):
-        if jax.tree.structure(cfg) != ref_structure:
+        if frozenset(cfg.keys()) != ref_keys:
             raise ValueError(
-                f"configs[{i}] has a different pytree structure than configs[0]. "
-                f"All configs must be the same type with the same fields.\n"
-                f"  configs[0]: {configs[0]!r}\n"
-                f"  configs[{i}]: {cfg!r}"
+                f"configs[{i}] has different keys than configs[0]: "
+                f"{set(cfg.keys())} vs {set(configs[0].keys())}"
             )
 
-    cfg_type = type(configs[0])
-    _encode: Callable[[_C], Any] = encode if encode is not None else (lambda x: x)
+    tunable_names = ref_keys
 
-    def _decode(d: Any) -> _C:  # type: ignore[misc]
-        if decode is not None:
-            return decode(d)
-        # Fast path: if the cached value is already the right type, return it
-        # directly.  This handles plain scalars (int, str) and None configs.
-        if isinstance(d, cfg_type):
-            return d  # type: ignore[return-value]
-        # Check dict before tuple: a NamedTuple is-a tuple, so without this guard
-        # KC(*{"bm": 32}) would iterate dict keys ("bm") not values (32).
-        if isinstance(d, dict):
-            return cfg_type(**d)  # type: ignore[call-arg]
-        if issubclass(cfg_type, tuple):
-            return cfg_type(*d)  # type: ignore[call-arg]
-        return cfg_type(d)  # type: ignore[call-arg]
-
-    def decorator(
-        fn: Callable[Concatenate[_C, _P], _R],
-    ) -> Callable[_P, _R]:
-        if inspect.iscoroutinefunction(fn):
+    def decorator(fn: _F) -> _F:
+        if not hasattr(fn, "lower"):
             raise TypeError(
-                f"autotune does not support async functions ({fn.__qualname__!r}). "
-                f"JAX operations are synchronous — remove 'async' from the definition."
+                f"autotune expects a jax.jit-wrapped function, "
+                f"got {type(fn).__name__!r}.\n"
+                f"Stack @autotune on top of @jax.jit:\n\n"
+                f"    @autotune(configs=[...])\n"
+                f"    @jax.jit(static_argnames=[...])\n"
+                f"    def fn(...): ..."
             )
 
         fn_name = fn.__qualname__
 
-        # Validate that any key param declared in fn has a default.
-        # Key params are popped before fn is called, so a required (no-default)
-        # key param causes a cryptic "missing keyword argument" error in the sweep.
-        sig = inspect.signature(fn)
-        for k in key:
-            param = sig.parameters.get(k)
-            if param is not None and param.default is inspect.Parameter.empty:
-                raise TypeError(
-                    f"key parameter {k!r} in {fn.__qualname__!r} has no default. "
-                    f"Autotune pops key params before calling fn, so they are never "
-                    f"forwarded — add a default: {k}: ... = None"
-                )
-
-        # The config is the first positional arg and is static (static_argnums=0).
-        # Because configs are hashable, JAX produces one compiled artifact per unique
-        # config — exactly what Pallas kernels need (cfg.bm / cfg.bk determine the grid).
-        jitted_fn = jax.jit(fn, static_argnums=(0,))
+        # Validate tunable params against the underlying function's signature.
+        underlying = getattr(fn, "__wrapped__", None)
+        if underlying is not None:
+            sig = inspect.signature(underlying)
+            for k in tunable_names:
+                param = sig.parameters.get(k)
+                if param is None:
+                    raise TypeError(
+                        f"tunable parameter {k!r} from configs not found "
+                        f"in {fn.__qualname__!r}"
+                    )
+                if param.default is inspect.Parameter.empty:
+                    raise TypeError(
+                        f"tunable parameter {k!r} in {fn.__qualname__!r} has no "
+                        f"default. Autotune injects it at call time — add a "
+                        f"default, e.g. {k}: int = 0"
+                    )
 
         @functools.wraps(fn)
-        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
-            kw: dict[str, Any] = dict(kwargs)
-
-            # Extract key values — must be concrete Python values (problem shape).
-            key_values: dict[str, Any] = {}
-            for k in key:
-                if k not in kw:
-                    raise TypeError(
-                        f"autotune key {k!r} not found in kwargs. "
-                        f"Pass it as a keyword argument."
-                    )
-                key_values[k] = kw.pop(k)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            # User supplied tunable kwargs explicitly — bypass autotune.
+            if any(k in kwargs for k in tunable_names):
+                return fn(*args, **kwargs)
 
             device_name = get_device_name()
+            key_values = _make_cache_key(args, kwargs, tunable_names)
 
             raw = _cache.load_best(fn_name, device_name, key_values)
             if raw is not MISSING:
-                return fn(_decode(raw), *args, **kw)  # type: ignore[call-arg]
+                return fn(*args, **kwargs, **raw)
 
-            # Build concrete dummy inputs from args' abstract properties.
-            # ensure_compile_time_eval makes jnp.empty concrete even inside a jit
-            # trace: tracer.shape and tracer.dtype are always concrete.
+            # Build concrete dummy inputs so the sweep is safe inside any JAX
+            # trace context (jax.grad, jax.vmap, jax.lax.scan, etc.).
+            # ensure_compile_time_eval makes jnp.empty concrete even when args
+            # are abstract tracers — shape and dtype are always concrete.
             with jax.ensure_compile_time_eval():
                 dummy_args = jax.tree.map(
-                    lambda x: jnp.empty(x.shape, x.dtype)  # type: ignore[reportUnknownLambdaType]
-                    if hasattr(x, "shape") and hasattr(x, "dtype")
-                    else x,
+                    lambda a: jnp.empty(a.shape, a.dtype)  # type: ignore[reportUnknownLambdaType]
+                    if hasattr(a, "shape") and hasattr(a, "dtype")
+                    else a,
                     args,
                 )
                 dummy_kw = {
                     k: jnp.empty(v.shape, v.dtype)
                     if hasattr(v, "shape") and hasattr(v, "dtype")
                     else v
-                    for k, v in kw.items()
+                    for k, v in kwargs.items()
                 }
 
             # Compile all configs in parallel — XLA is CPU-bound and thread-safe.
-            # The config is static_argnums=0; the compiled artifact has no config input.
-            def _compile(cfg: _C) -> Any:
-                return jitted_fn.lower(cfg, *dummy_args, **dummy_kw).compile()
+            def _compile(cfg: dict[str, Any]) -> None:
+                jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
 
             with ThreadPoolExecutor() as pool:
-                futures = {cfg: pool.submit(_compile, cfg) for cfg in configs}
-            compiled_map = {cfg: f.result() for cfg, f in futures.items()}
+                list(pool.map(_compile, configs))
 
-            # Time each compiled artifact sequentially for accurate device timing.
+            # Time each config sequentially for accurate device measurements.
             best_config = configs[0]
             best_time = float("inf")
 
-            for cfg, exe in compiled_map.items():
+            for cfg in configs:
                 for _ in range(num_warmup):
-                    jax.block_until_ready(exe(*dummy_args, **dummy_kw))
+                    jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
                 times = []
                 for _ in range(num_timing):
                     t0 = time.perf_counter()
-                    jax.block_until_ready(exe(*dummy_args, **dummy_kw))
+                    jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
                     times.append((time.perf_counter() - t0) * 1000)
                 median = sorted(times)[len(times) // 2]
                 if median < best_time:
                     best_time = median
                     best_config = cfg
 
-            _cache.save_best(
-                fn_name, device_name, key_values, _encode(best_config), best_time
-            )
-
-            # Call fn with the original args + best config as first positional.
-            # When inside a jit trace this is the only call that lands in the jaxpr.
-            return fn(best_config, *args, **kw)  # type: ignore[call-arg]
+            _cache.save_best(fn_name, device_name, key_values, best_config, best_time)
+            return fn(*args, **kwargs, **best_config)
 
         return wrapper  # type: ignore[return-value]
 
