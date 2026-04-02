@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 
 from tonno import cache as _cache
+from tonno.cache import _MISSING
 from tonno.hardware import get_device_name
 
 _C = TypeVar("_C", bound=Hashable)
@@ -87,13 +88,27 @@ def autotune(
     def _decode(d: Any) -> _C:  # type: ignore[misc]
         if decode is not None:
             return decode(d)
+        # Fast path: if the cached value is already the right type, return it
+        # directly.  This handles plain scalars (int, str) and None configs.
+        if isinstance(d, cfg_type):
+            return d  # type: ignore[return-value]
+        # Check dict before tuple: a NamedTuple is-a tuple, so without this guard
+        # KC(*{"bm": 32}) would iterate dict keys ("bm") not values (32).
+        if isinstance(d, dict):
+            return cfg_type(**d)  # type: ignore[call-arg]
         if issubclass(cfg_type, tuple):
             return cfg_type(*d)  # type: ignore[call-arg]
-        return cfg_type(**d) if isinstance(d, dict) else cfg_type(d)  # type: ignore[call-arg]
+        return cfg_type(d)  # type: ignore[call-arg]
 
     def decorator(
         fn: Callable[Concatenate[_C, _P], _R],
     ) -> Callable[_P, _R]:
+        if inspect.iscoroutinefunction(fn):
+            raise TypeError(
+                f"autotune does not support async functions ({fn.__qualname__!r}). "
+                f"JAX operations are synchronous — remove 'async' from the definition."
+            )
+
         fn_name = fn.__qualname__
 
         # Validate that any key param declared in fn has a default.
@@ -131,7 +146,7 @@ def autotune(
             device_name = get_device_name()
 
             raw = _cache.load_best(fn_name, device_name, key_values)
-            if raw is not None:
+            if raw is not _MISSING:
                 return fn(_decode(raw), *args, **kw)  # type: ignore[call-arg]
 
             # Build concrete dummy inputs from args' abstract properties.
@@ -139,11 +154,11 @@ def autotune(
             # trace: tracer.shape and tracer.dtype are always concrete.
             with jax.ensure_compile_time_eval():
                 dummy_args = jax.tree.map(
-                    lambda x: jnp.empty(x.shape, x.dtype) if isinstance(x, jax.Array) else x,
+                    lambda x: jnp.empty(x.shape, x.dtype) if hasattr(x, "shape") and hasattr(x, "dtype") else x,
                     args,
                 )
                 dummy_kw = {
-                    k: jnp.empty(v.shape, v.dtype) if hasattr(v, "shape") else v
+                    k: jnp.empty(v.shape, v.dtype) if hasattr(v, "shape") and hasattr(v, "dtype") else v
                     for k, v in kw.items()
                 }
 
