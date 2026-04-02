@@ -30,6 +30,7 @@ typeCheckingMode = "strict"
 venvPath = "."
 venv = ".venv"
 include = ["src/tonno"]
+exclude = ["tests/"]
 reportUnknownVariableType = false
 reportUnknownMemberType = false
 reportUnknownArgumentType = false
