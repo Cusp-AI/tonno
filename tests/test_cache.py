@@ -3,6 +3,7 @@
 The cache stores and retrieves raw JSON-serialisable data.
 Encoding/decoding config objects is the caller's responsibility.
 """
+
 import json
 import platform
 import threading
@@ -11,7 +12,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from tonno.cache import _MISSING, _cache_dir, _cache_path, _make_key, load_best, save_best
+from tonno.cache import (
+    MISSING,
+    _cache_dir,
+    _cache_path,
+    _make_key,
+    load_best,
+    save_best,
+)
 
 
 def test_save_and_load(tmp_path, monkeypatch):
@@ -20,7 +28,7 @@ def test_save_and_load(tmp_path, monkeypatch):
     config_data = {"bm": 32, "bk": 64}
     key_values = {"N": 1024, "D": 256}
 
-    assert load_best("my_fn", "cpu", key_values) is _MISSING
+    assert load_best("my_fn", "cpu", key_values) is MISSING
 
     save_best("my_fn", "cpu", key_values, config_data, 1.234)
 
@@ -32,19 +40,19 @@ def test_save_and_load(tmp_path, monkeypatch):
 
 
 def test_load_best_empty_key_values(tmp_path, monkeypatch):
-    """load_best with key_values={} and no file returns _MISSING without crashing."""
+    """load_best with key_values={} and no file returns MISSING without crashing."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
-    assert load_best("fn", "cpu", {}) is _MISSING
+    assert load_best("fn", "cpu", {}) is MISSING
 
 
 def test_load_best_non_dict_json_returns_none(tmp_path, monkeypatch):
     """Cache file holds valid JSON that is not a dict (list, string) → returns None."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
     (tmp_path / "fn.json").write_text(json.dumps([1, 2, 3]))
-    assert load_best("fn", "cpu", {"N": 4}) is _MISSING
+    assert load_best("fn", "cpu", {"N": 4}) is MISSING
 
     (tmp_path / "fn.json").write_text(json.dumps("oops"))
-    assert load_best("fn", "cpu", {"N": 4}) is _MISSING
+    assert load_best("fn", "cpu", {"N": 4}) is MISSING
 
 
 def test_save_best_numpy_scalar_key_coerced(tmp_path, monkeypatch):
@@ -105,6 +113,7 @@ def test_different_devices(tmp_path, monkeypatch):
 # Adversarial runtime / environment edge cases
 # ===========================================================================
 
+
 def test_empty_device_name_roundtrip(tmp_path, monkeypatch):
     """Device name '' is a valid JSON key — save and load must round-trip."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
@@ -116,9 +125,9 @@ def test_empty_device_name_roundtrip(tmp_path, monkeypatch):
 def test_empty_device_name_isolated_from_named_device(tmp_path, monkeypatch):
     """'' and 'cpu' stored in the same file must not alias each other."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
-    save_best("fn", "",    {"N": 4}, {"bm": 1}, 1.0)
+    save_best("fn", "", {"N": 4}, {"bm": 1}, 1.0)
     save_best("fn", "cpu", {"N": 4}, {"bm": 2}, 1.0)
-    assert load_best("fn", "",    {"N": 4}) == {"bm": 1}
+    assert load_best("fn", "", {"N": 4}) == {"bm": 1}
     assert load_best("fn", "cpu", {"N": 4}) == {"bm": 2}
 
 
@@ -159,19 +168,21 @@ def test_very_long_fn_name_raises_or_truncates(tmp_path, monkeypatch):
 
 
 def test_load_best_entry_missing_config_key_returns_missing(tmp_path, monkeypatch):
-    """entry exists in JSON but has no 'config' field → _MISSING returned gracefully."""
+    """entry exists in JSON but has no 'config' field → MISSING returned gracefully."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
     key = _make_key({"N": 4})
     bad = {"cpu": {key: {"time_ms": 0.5, "key_values": {"N": 4}}}}
     (tmp_path / "fn.json").write_text(json.dumps(bad))
-    assert load_best("fn", "cpu", {"N": 4}) is _MISSING
+    assert load_best("fn", "cpu", {"N": 4}) is MISSING
 
 
 def test_load_best_null_config_returns_none(tmp_path, monkeypatch):
     """JSON null stored as config value → load_best returns None (valid cache hit, not a miss)."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
     key = _make_key({"N": 4})
-    null_entry = {"cpu": {key: {"config": None, "time_ms": 0.1, "key_values": {"N": 4}}}}
+    null_entry = {
+        "cpu": {key: {"config": None, "time_ms": 0.1, "key_values": {"N": 4}}}
+    }
     (tmp_path / "fn.json").write_text(json.dumps(null_entry))
     result = load_best("fn", "cpu", {"N": 4})
     assert result is None
@@ -192,28 +203,35 @@ def test_concurrent_saves_preserve_both_entries(tmp_path, monkeypatch):
 
     t1 = threading.Thread(target=writer, args=(4,))
     t2 = threading.Thread(target=writer, args=(8,))
-    t1.start(); t2.start()
-    t1.join();  t2.join()
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
     assert errors == [], errors
     r4 = load_best("fn", "cpu", {"N": 4})
     r8 = load_best("fn", "cpu", {"N": 8})
-    assert r4 == {"bm": 4}, f"N=4 entry lost — concurrent write race still present: {r4}"
-    assert r8 == {"bm": 8}, f"N=8 entry lost — concurrent write race still present: {r8}"
+    assert r4 == {"bm": 4}, (
+        f"N=4 entry lost — concurrent write race still present: {r4}"
+    )
+    assert r8 == {"bm": 8}, (
+        f"N=8 entry lost — concurrent write race still present: {r8}"
+    )
 
 
 def test_cache_dir_env_var_change_mid_session(tmp_path, monkeypatch):
     """_cache_dir() is lazy — changing TONNO_CACHE_DIR between save and load gives a miss."""
     dir_a = tmp_path / "a"
     dir_b = tmp_path / "b"
-    dir_a.mkdir(); dir_b.mkdir()
+    dir_a.mkdir()
+    dir_b.mkdir()
 
     monkeypatch.setenv("TONNO_CACHE_DIR", str(dir_a))
     save_best("fn", "cpu", {"N": 4}, {"bm": 16}, 1.0)
     assert load_best("fn", "cpu", {"N": 4}) == {"bm": 16}
 
     monkeypatch.setenv("TONNO_CACHE_DIR", str(dir_b))
-    assert load_best("fn", "cpu", {"N": 4}) is _MISSING
+    assert load_best("fn", "cpu", {"N": 4}) is MISSING
 
 
 def test_cache_dir_env_var_unset_falls_back_to_default(monkeypatch):
@@ -354,6 +372,7 @@ def test_saved_file_is_valid_json(tmp_path, monkeypatch):
 # Adversarial runtime / environment edge cases — iteration 2
 # ===========================================================================
 
+
 def test_make_key_bool_true_and_false_distinct():
     """True and False produce different JSON keys (true vs false)."""
     assert _make_key({"flag": True}) != _make_key({"flag": False})
@@ -370,7 +389,7 @@ def test_make_key_bool_roundtrip(tmp_path, monkeypatch):
     config = {"bm": 8}
     save_best("fn", "cpu", {"flag": True}, config, 1.0)
     assert load_best("fn", "cpu", {"flag": True}) == config
-    assert load_best("fn", "cpu", {"flag": False}) is _MISSING
+    assert load_best("fn", "cpu", {"flag": False}) is MISSING
 
 
 def test_make_key_numpy_bool_equals_python_bool():
@@ -431,9 +450,9 @@ def test_negative_and_positive_int_keys_distinct(tmp_path, monkeypatch):
     """-1 and 1 are different keys and must not collide."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
     save_best("fn", "cpu", {"N": -1}, {"bm": 1}, 1.0)
-    save_best("fn", "cpu", {"N":  1}, {"bm": 2}, 1.0)
+    save_best("fn", "cpu", {"N": 1}, {"bm": 2}, 1.0)
     assert load_best("fn", "cpu", {"N": -1}) == {"bm": 1}
-    assert load_best("fn", "cpu", {"N":  1}) == {"bm": 2}
+    assert load_best("fn", "cpu", {"N": 1}) == {"bm": 2}
 
 
 def test_save_null_config_file_is_valid_json(tmp_path, monkeypatch):
@@ -450,7 +469,9 @@ def test_save_null_config_stored_in_entry(tmp_path, monkeypatch):
     assert load_best("fn", "cpu", {"N": 4}) is None
 
 
-@pytest.mark.skipif(platform.system() == "Windows", reason="symlinks require privileges on Windows")
+@pytest.mark.skipif(
+    platform.system() == "Windows", reason="symlinks require privileges on Windows"
+)
 def test_symlink_cache_file_write_follows_link(tmp_path, monkeypatch):
     """If fn.json is a symlink to a writable target, write_text follows it."""
     real_file = tmp_path / "real_cache.json"
@@ -465,7 +486,9 @@ def test_symlink_cache_file_write_follows_link(tmp_path, monkeypatch):
     assert load_best("fn", "cpu", {"N": 4}) == {"bm": 8}
 
 
-@pytest.mark.skipif(platform.system() == "Windows", reason="symlinks require privileges on Windows")
+@pytest.mark.skipif(
+    platform.system() == "Windows", reason="symlinks require privileges on Windows"
+)
 def test_symlink_pointing_to_dev_null_returns_none_on_load(tmp_path, monkeypatch):
     """/dev/null swallows writes; read returns '' → JSONDecodeError → None."""
     link_file = tmp_path / "fn.json"
@@ -473,7 +496,7 @@ def test_symlink_pointing_to_dev_null_returns_none_on_load(tmp_path, monkeypatch
 
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
     save_best("fn", "cpu", {"N": 4}, {"bm": 8}, 1.0)
-    assert load_best("fn", "cpu", {"N": 4}) is _MISSING
+    assert load_best("fn", "cpu", {"N": 4}) is MISSING
 
 
 def test_make_key_integer_dict_key_coercion():
@@ -496,24 +519,26 @@ def test_save_load_tuple_key_value_roundtrip(tmp_path, monkeypatch):
 
 
 def test_load_best_device_data_is_list_returns_missing(tmp_path, monkeypatch):
-    """device_data is a list — not a dict, so treated as a corrupt entry → _MISSING."""
+    """device_data is a list — not a dict, so treated as a corrupt entry → MISSING."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
     (tmp_path / "fn.json").write_text(json.dumps({"cpu": [1, 2, 3]}))
-    assert load_best("fn", "cpu", {"N": 4}) is _MISSING
+    assert load_best("fn", "cpu", {"N": 4}) is MISSING
 
 
 def test_load_best_entry_is_integer_returns_missing(tmp_path, monkeypatch):
-    """Entry value is an integer — not a dict, treated as corrupt → _MISSING."""
+    """Entry value is an integer — not a dict, treated as corrupt → MISSING."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
     (tmp_path / "fn.json").write_text(json.dumps({"cpu": {_make_key({"N": 4}): 42}}))
-    assert load_best("fn", "cpu", {"N": 4}) is _MISSING
+    assert load_best("fn", "cpu", {"N": 4}) is MISSING
 
 
 def test_load_best_entry_is_string_returns_missing(tmp_path, monkeypatch):
-    """Entry value is a string — not a dict, treated as corrupt → _MISSING."""
+    """Entry value is a string — not a dict, treated as corrupt → MISSING."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
-    (tmp_path / "fn.json").write_text(json.dumps({"cpu": {_make_key({"N": 4}): "oops"}}))
-    assert load_best("fn", "cpu", {"N": 4}) is _MISSING
+    (tmp_path / "fn.json").write_text(
+        json.dumps({"cpu": {_make_key({"N": 4}): "oops"}})
+    )
+    assert load_best("fn", "cpu", {"N": 4}) is MISSING
 
 
 def test_save_load_deeply_nested_config(tmp_path, monkeypatch):
@@ -540,7 +565,9 @@ def test_saved_file_unicode_is_valid_utf8(tmp_path, monkeypatch):
     assert json.loads(raw)["cpu"][_make_key({"N": 1})]["config"] == {"name": "α"}
 
 
-@pytest.mark.skipif(platform.system() == "Windows", reason="forward slash semantics differ on Windows")
+@pytest.mark.skipif(
+    platform.system() == "Windows", reason="forward slash semantics differ on Windows"
+)
 def test_fn_name_with_slash_creates_subdirectory(tmp_path, monkeypatch):
     """fn_name='outer/inner' resolves to cache_dir/outer/inner.json via parents=True mkdir."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))

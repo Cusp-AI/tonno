@@ -9,9 +9,9 @@ Autotune injects the best config; callers never pass it.
 
     fn(jnp.ones(4), N=4)   # cfg injected automatically
 """
+
 from __future__ import annotations
 
-import asyncio
 import json
 import threading
 from typing import Any, NamedTuple
@@ -23,10 +23,10 @@ import pytest
 
 from tonno import autotune
 
-
 # ---------------------------------------------------------------------------
 # Config types used in tests
 # ---------------------------------------------------------------------------
+
 
 class KC(NamedTuple):
     scale: int = 1
@@ -51,6 +51,7 @@ class KCTwo(NamedTuple):
 
 class _Pair:
     """Minimal custom pytree node for testing."""
+
     def __init__(self, a: jax.Array, b: jax.Array) -> None:
         self.a = a
         self.b = b
@@ -67,6 +68,7 @@ jax.tree_util.register_pytree_node(
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _fn(configs: list[KC] | None = None, key: tuple[str, ...] = ("N",)):
     if configs is None:
         configs = [KC(1), KC(2)]
@@ -81,6 +83,7 @@ def _fn(configs: list[KC] | None = None, key: tuple[str, ...] = ("N",)):
 # ===========================================================================
 # Core behaviour
 # ===========================================================================
+
 
 def test_autotune_selects_config(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
@@ -124,8 +127,10 @@ def test_autotune_missing_key():
 # Decoration-time validation
 # ===========================================================================
 
+
 def test_empty_configs_raises():
     with pytest.raises(ValueError, match="empty"):
+
         @autotune(configs=[], key=["N"])
         def fn(cfg: KC, x: jax.Array) -> jax.Array:
             return x
@@ -149,6 +154,7 @@ def test_key_param_without_default_raises_at_decoration():
     'missing required keyword-only argument' from inside jitted_fn.lower().
     """
     with pytest.raises(TypeError, match="has no default"):
+
         @autotune(configs=[KC(1)], key=["N"])
         def fn(cfg: KC, x: jax.Array, *, N: int) -> jax.Array:  # type: ignore[misc]
             return x * cfg.scale
@@ -156,6 +162,7 @@ def test_key_param_without_default_raises_at_decoration():
 
 def test_heterogeneous_configs_raises():
     """Configs with different pytree structures → ValueError at decoration time."""
+
     class KCA(NamedTuple):
         a: int
 
@@ -163,6 +170,7 @@ def test_heterogeneous_configs_raises():
         b: int
 
     with pytest.raises(ValueError, match="pytree structure"):
+
         @autotune(configs=[KCA(1), KCB(2)], key=["N"])  # type: ignore[arg-type]
         def fn(cfg: KCA, x: jax.Array) -> jax.Array:
             return x
@@ -170,6 +178,7 @@ def test_heterogeneous_configs_raises():
 
 def test_num_timing_zero_raises():
     with pytest.raises(ValueError, match="num_timing"):
+
         @autotune(configs=[KC(1)], key=["N"], num_timing=0)
         def fn(cfg: KC, x: jax.Array) -> jax.Array:
             return x
@@ -177,6 +186,7 @@ def test_num_timing_zero_raises():
 
 def test_num_timing_negative_raises():
     with pytest.raises(ValueError, match="num_timing"):
+
         @autotune(configs=[KC(1)], key=["N"], num_timing=-1)
         def fn(cfg: KC, x: jax.Array) -> jax.Array:
             return x
@@ -184,6 +194,7 @@ def test_num_timing_negative_raises():
 
 def test_num_warmup_negative_raises():
     with pytest.raises(ValueError, match="num_warmup"):
+
         @autotune(configs=[KC(1)], key=["N"], num_warmup=-1)
         def fn(cfg: KC, x: jax.Array) -> jax.Array:
             return x
@@ -212,6 +223,7 @@ def test_num_timing_one_works(tmp_path, monkeypatch):
 # ===========================================================================
 # Sweep edge cases
 # ===========================================================================
+
 
 def test_single_config(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
@@ -316,6 +328,7 @@ def test_non_array_positional_arg_works(tmp_path, monkeypatch):
 # ===========================================================================
 # JAX integration
 # ===========================================================================
+
 
 def test_jax_grad_warm_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
@@ -424,7 +437,9 @@ def test_kwarg_shape_but_no_dtype_raises(tmp_path, monkeypatch):
         shape = (4,)
 
     @autotune(configs=[KC(1)], key=["N"])
-    def fn(cfg: KC, x: jax.Array, *, weights: object, N: int | None = None) -> jax.Array:
+    def fn(
+        cfg: KC, x: jax.Array, *, weights: object, N: int | None = None
+    ) -> jax.Array:
         return x * cfg.scale
 
     with pytest.raises((TypeError, AttributeError)):
@@ -450,6 +465,7 @@ def test_float_config_survives_cache_roundtrip(tmp_path, monkeypatch):
 # ===========================================================================
 # Behavioural pins (known limitations)
 # ===========================================================================
+
 
 def test_pin_cache_miss_and_hit_same_result(tmp_path, monkeypatch):
     """Cache-miss and cache-hit paths return numerically identical results."""
@@ -498,6 +514,7 @@ def test_pin_qualname_collision(tmp_path, monkeypatch):
         @autotune(configs=configs, key=["N"])
         def compute(cfg: KC, x: jax.Array, *, N: int | None = None) -> jax.Array:
             return x * cfg.scale
+
         return compute
 
     v1 = build([KC(1)])
@@ -513,12 +530,8 @@ def test_pin_two_lambdas_share_cache(tmp_path, monkeypatch):
     """Two lambdas have the same __qualname__ → share cache → collision."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
 
-    fn1 = autotune(configs=[KC(1)], key=["N"])(
-        lambda cfg, x, *, N=None: x * cfg.scale
-    )
-    fn2 = autotune(configs=[KC(99)], key=["N"])(
-        lambda cfg, x, *, N=None: x * cfg.scale
-    )
+    fn1 = autotune(configs=[KC(1)], key=["N"])(lambda cfg, x, *, N=None: x * cfg.scale)
+    fn2 = autotune(configs=[KC(99)], key=["N"])(lambda cfg, x, *, N=None: x * cfg.scale)
 
     fn1(jnp.ones(4), N=4)
     r2 = fn2(jnp.ones(4), N=4)  # hits fn1's cache → scale=1, not 99
@@ -557,6 +570,7 @@ def test_pin_dtype_not_in_cache_key(tmp_path, monkeypatch):
 # Cache edge cases (decorator-level view)
 # ===========================================================================
 
+
 def test_corrupt_cache_degrades_gracefully(tmp_path, monkeypatch):
     """Corrupt cache → treated as miss, sweep runs, result returned."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
@@ -569,7 +583,15 @@ def test_stale_config_raises_on_decode(tmp_path, monkeypatch):
     """Cache with wrong field names → TypeError when decoder calls KC(**bad_data)."""
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
     fn = _fn()  # uses KC(scale=...)
-    bad = {"cpu": {'{"N":4}': {"config": {"WRONG_KEY": 42}, "time_ms": 0.5, "key_values": {"N": 4}}}}
+    bad = {
+        "cpu": {
+            '{"N":4}': {
+                "config": {"WRONG_KEY": 42},
+                "time_ms": 0.5,
+                "key_values": {"N": 4},
+            }
+        }
+    }
     (tmp_path / f"{fn.__qualname__}.json").write_text(json.dumps(bad))
     with pytest.raises(TypeError):
         fn(jnp.ones(4), N=4)
@@ -583,6 +605,7 @@ def test_nested_qualname_cache_file(tmp_path, monkeypatch):
         @autotune(configs=[KC(1)], key=["N"])
         def inner(cfg: KC, x: jax.Array, *, N: int | None = None) -> jax.Array:
             return x * cfg.scale
+
         return inner
 
     fn = outer()
@@ -628,9 +651,11 @@ def test_concurrent_first_call_no_exception(tmp_path, monkeypatch):
 # Adversarial API contract scenarios
 # ===========================================================================
 
+
 def test_unhashable_list_config_raises():
     """list config → TypeError when used as dict key in futures dict."""
     with pytest.raises(TypeError):
+
         @autotune(configs=[[1, 2], [3, 4]], key=["N"])  # type: ignore[arg-type]
         def fn(cfg, x: jax.Array, *, N: int | None = None) -> jax.Array:
             return x
@@ -641,6 +666,7 @@ def test_unhashable_list_config_raises():
 def test_unhashable_set_config_raises():
     """set config → TypeError at hashtable insertion."""
     with pytest.raises(TypeError):
+
         @autotune(configs=[{1, 2}, {3, 4}], key=["N"])  # type: ignore[arg-type]
         def fn(cfg, x: jax.Array, *, N: int | None = None) -> jax.Array:
             return x
@@ -651,6 +677,7 @@ def test_unhashable_set_config_raises():
 def test_unhashable_dict_config_raises():
     """dict config → TypeError at hashtable insertion."""
     with pytest.raises(TypeError):
+
         @autotune(configs=[{"a": 1}, {"a": 2}], key=["N"])  # type: ignore[arg-type]
         def fn(cfg, x: jax.Array, *, N: int | None = None) -> jax.Array:
             return x
@@ -784,7 +811,9 @@ def test_cached_null_config_raises_decode_error(tmp_path, monkeypatch):
     def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> jax.Array:
         return x * cfg.scale
 
-    payload = {"cpu": {'{"N":4}': {"config": None, "time_ms": 0.1, "key_values": {"N": 4}}}}
+    payload = {
+        "cpu": {'{"N":4}': {"config": None, "time_ms": 0.1, "key_values": {"N": 4}}}
+    }
     (tmp_path / f"{fn.__qualname__}.json").write_text(json.dumps(payload))
 
     with pytest.raises(TypeError):
@@ -799,7 +828,9 @@ def test_cached_int_for_namedtuple_raises(tmp_path, monkeypatch):
     def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> jax.Array:
         return x * cfg.scale
 
-    payload = {"cpu": {'{"N":4}': {"config": 42, "time_ms": 0.1, "key_values": {"N": 4}}}}
+    payload = {
+        "cpu": {'{"N":4}': {"config": 42, "time_ms": 0.1, "key_values": {"N": 4}}}
+    }
     (tmp_path / f"{fn.__qualname__}.json").write_text(json.dumps(payload))
 
     with pytest.raises((TypeError, Exception)):
@@ -814,11 +845,15 @@ def test_cached_dict_with_extra_fields_raises(tmp_path, monkeypatch):
     def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> jax.Array:
         return x * cfg.scale
 
-    payload = {"cpu": {'{"N":4}': {
-        "config": {"scale": 1, "unexpected_field": 99},
-        "time_ms": 0.1,
-        "key_values": {"N": 4},
-    }}}
+    payload = {
+        "cpu": {
+            '{"N":4}': {
+                "config": {"scale": 1, "unexpected_field": 99},
+                "time_ms": 0.1,
+                "key_values": {"N": 4},
+            }
+        }
+    }
     (tmp_path / f"{fn.__qualname__}.json").write_text(json.dumps(payload))
 
     with pytest.raises(TypeError):
@@ -833,7 +868,9 @@ def test_cached_list_for_namedtuple_decodes_correctly(tmp_path, monkeypatch):
     def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> jax.Array:
         return x * cfg.scale
 
-    payload = {"cpu": {'{"N":4}': {"config": [1], "time_ms": 0.1, "key_values": {"N": 4}}}}
+    payload = {
+        "cpu": {'{"N":4}': {"config": [1], "time_ms": 0.1, "key_values": {"N": 4}}}
+    }
     (tmp_path / f"{fn.__qualname__}.json").write_text(json.dumps(payload))
 
     result = fn(jnp.ones(4), N=4)
@@ -876,11 +913,15 @@ def test_namedtuple_with_cached_dict_decodes_correctly(tmp_path, monkeypatch):
     def fn(cfg: KCTwo, x: jax.Array, *, N: int | None = None) -> jax.Array:
         return x * cfg.bm
 
-    payload = {"cpu": {'{"N":4}': {
-        "config": {"bm": 32, "bk": 64},
-        "time_ms": 0.1,
-        "key_values": {"N": 4},
-    }}}
+    payload = {
+        "cpu": {
+            '{"N":4}': {
+                "config": {"bm": 32, "bk": 64},
+                "time_ms": 0.1,
+                "key_values": {"N": 4},
+            }
+        }
+    }
     (tmp_path / f"{fn.__qualname__}.json").write_text(json.dumps(payload))
 
     result = fn(jnp.ones(4), N=4)
@@ -944,7 +985,9 @@ def test_multiple_keys_happy_path(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
 
     @autotune(configs=[KC(1), KC(2)], key=["M", "N"])
-    def fn(cfg: KC, x: jax.Array, *, M: int | None = None, N: int | None = None) -> jax.Array:
+    def fn(
+        cfg: KC, x: jax.Array, *, M: int | None = None, N: int | None = None
+    ) -> jax.Array:
         return x * cfg.scale
 
     fn(jnp.ones(4), M=8, N=4)
@@ -959,7 +1002,9 @@ def test_multiple_keys_missing_one_raises(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
 
     @autotune(configs=[KC(1)], key=["M", "N"])
-    def fn(cfg: KC, x: jax.Array, *, M: int | None = None, N: int | None = None) -> jax.Array:
+    def fn(
+        cfg: KC, x: jax.Array, *, M: int | None = None, N: int | None = None
+    ) -> jax.Array:
         return x * cfg.scale
 
     with pytest.raises(TypeError, match="M|N"):
@@ -1051,6 +1096,7 @@ def test_single_int_config_cache_roundtrip(tmp_path, monkeypatch):
 # ===========================================================================
 # Adversarial JAX execution model scenarios
 # ===========================================================================
+
 
 def test_jit_cold_no_retrace_on_second_call(tmp_path, monkeypatch):
     """First jit call triggers sweep; second call reuses cached jit trace."""
@@ -1316,7 +1362,7 @@ def test_second_order_grad_warm_cache(tmp_path, monkeypatch):
 
     @autotune(configs=[KC(1), KC(2)], key=["N"])
     def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> jax.Array:
-        return jnp.sum(x ** 2 * cfg.scale)
+        return jnp.sum(x**2 * cfg.scale)
 
     fn(jnp.array(1.0), N=1)
     g2 = jax.grad(jax.grad(lambda x: fn(x, N=1)))(jnp.array(3.0))
@@ -1360,10 +1406,11 @@ def test_plain_int_config_jax(tmp_path, monkeypatch):
 # Adversarial API contract scenarios — iteration 2
 # ===========================================================================
 
+
 def test_none_config_round_trips_correctly(tmp_path, monkeypatch):
     """None config: encodes to null, load_best returns None (valid hit), _decode returns None.
 
-    The _MISSING sentinel fixes the perpetual-miss bug: null is now a valid cache
+    The MISSING sentinel fixes the perpetual-miss bug: null is now a valid cache
     entry, not a miss indicator.  The isinstance(d, type(None)) fast-path in _decode
     returns None directly, so fn(None, ...) is called on the second call (cache hit).
     """
@@ -1375,9 +1422,9 @@ def test_none_config_round_trips_correctly(tmp_path, monkeypatch):
         call_count[0] += 1
         return x
 
-    fn(jnp.ones(4), N=4)          # cache miss — sweep runs
+    fn(jnp.ones(4), N=4)  # cache miss — sweep runs
     after_sweep = call_count[0]
-    fn(jnp.ones(4), N=4)          # cache hit — no sweep, one call via decode path
+    fn(jnp.ones(4), N=4)  # cache hit — no sweep, one call via decode path
     assert call_count[0] == after_sweep + 1  # exactly one call, not a re-sweep
 
 
@@ -1402,6 +1449,7 @@ def test_async_fn_raises_at_decoration_time(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
 
     with pytest.raises(TypeError, match="async"):
+
         @autotune(configs=[KC(1)], key=["N"])
         async def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> jax.Array:  # type: ignore[misc]
             return x * cfg.scale
@@ -1476,6 +1524,7 @@ def test_qualname_with_angle_brackets_creates_cache_file(tmp_path, monkeypatch):
         @autotune(configs=[KC(1)], key=["N"])
         def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> jax.Array:
             return x * cfg.scale
+
         return fn
 
     fn = factory()
@@ -1524,6 +1573,7 @@ def test_identical_timing_returns_first_config(tmp_path, monkeypatch):
         return x * cfg.scale
 
     import time as _time
+
     monkeypatch.setattr(_time, "perf_counter", lambda: 0.0)
     fn(jnp.ones(4), N=4)
     assert chosen[-1] == 1
@@ -1584,6 +1634,7 @@ def test_fn_execution_error_during_sweep_propagates(tmp_path, monkeypatch):
 # ===========================================================================
 # Adversarial JAX execution model scenarios — iteration 2
 # ===========================================================================
+
 
 def test_eval_shape_cold_cache_returns_correct_abstract_shape(tmp_path, monkeypatch):
     """eval_shape on cold-cache fn triggers sweep and returns the right abstract shape."""
@@ -1864,7 +1915,9 @@ def test_tuple_output_cold_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
 
     @autotune(configs=[KC(1), KC(2)], key=["N"])
-    def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> tuple[jax.Array, jax.Array]:
+    def fn(
+        cfg: KC, x: jax.Array, *, N: int | None = None
+    ) -> tuple[jax.Array, jax.Array]:
         return (x * cfg.scale, x * cfg.scale * 2)
 
     r = fn(jnp.ones(4), N=4)
@@ -1877,7 +1930,9 @@ def test_tuple_output_warm_cache(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
 
     @autotune(configs=[KC(1), KC(2)], key=["N"])
-    def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> tuple[jax.Array, jax.Array]:
+    def fn(
+        cfg: KC, x: jax.Array, *, N: int | None = None
+    ) -> tuple[jax.Array, jax.Array]:
         return (x * cfg.scale, x * cfg.scale * 2)
 
     x = jnp.ones(4)
@@ -1891,7 +1946,9 @@ def test_tuple_output_values_are_consistent(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
 
     @autotune(configs=[KC(1), KC(2)], key=["N"])
-    def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> tuple[jax.Array, jax.Array]:
+    def fn(
+        cfg: KC, x: jax.Array, *, N: int | None = None
+    ) -> tuple[jax.Array, jax.Array]:
         return (x * cfg.scale, x * cfg.scale * 2)
 
     r = fn(jnp.ones(4), N=4)
@@ -1903,7 +1960,9 @@ def test_tuple_output_inside_jit(tmp_path, monkeypatch):
     monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
 
     @autotune(configs=[KC(1), KC(2)], key=["N"])
-    def fn(cfg: KC, x: jax.Array, *, N: int | None = None) -> tuple[jax.Array, jax.Array]:
+    def fn(
+        cfg: KC, x: jax.Array, *, N: int | None = None
+    ) -> tuple[jax.Array, jax.Array]:
         return (x * cfg.scale, x * cfg.scale * 2)
 
     fn(jnp.ones(4), N=4)

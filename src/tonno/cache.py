@@ -11,7 +11,7 @@ _DEFAULT_CACHE_DIR = ".tonno-cache"
 
 # Sentinel returned by load_best when no cache entry is found.
 # Distinguishes "not found" from "found with a null/None config value".
-_MISSING: Any = object()
+MISSING: Any = object()
 
 _write_lock = threading.Lock()
 
@@ -45,31 +45,31 @@ def load_best(
     device_name: str,
     key_values: dict[str, Any],
 ) -> Any:
-    """Return the raw cached config data, or ``_MISSING`` if not found.
+    """Return the raw cached config data, or ``MISSING`` if not found.
 
-    Returns ``_MISSING`` (not ``None``) so that callers can distinguish
+    Returns ``MISSING`` (not ``None``) so that callers can distinguish
     "entry not present" from "entry present with a null config value".
     The caller is responsible for decoding the returned value back into
     the original config type.
     """
     path = _cache_path(fn_name)
     if not path.exists():
-        return _MISSING
+        return MISSING
 
     try:
         data = json.loads(path.read_text())
     except json.JSONDecodeError:
-        return _MISSING
+        return MISSING
     if not isinstance(data, dict):
-        return _MISSING
+        return MISSING
 
     device_data = data.get(device_name)
     if not isinstance(device_data, dict):
-        return _MISSING
+        return MISSING
 
     entry = device_data.get(_make_key(key_values))
     if not isinstance(entry, dict) or "config" not in entry:
-        return _MISSING
+        return MISSING
 
     return entry["config"]
 
@@ -95,7 +95,7 @@ def save_best(
     path = _cache_path(fn_name)
 
     with _write_lock:
-        data: dict = {}
+        data: dict[str, Any] = {}
         if path.exists():
             try:
                 data = json.loads(path.read_text())

@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 
 from tonno import cache as _cache
-from tonno.cache import _MISSING
+from tonno.cache import MISSING
 from tonno.hardware import get_device_name
 
 _C = TypeVar("_C", bound=Hashable)
@@ -146,7 +146,7 @@ def autotune(
             device_name = get_device_name()
 
             raw = _cache.load_best(fn_name, device_name, key_values)
-            if raw is not _MISSING:
+            if raw is not MISSING:
                 return fn(_decode(raw), *args, **kw)  # type: ignore[call-arg]
 
             # Build concrete dummy inputs from args' abstract properties.
@@ -154,11 +154,15 @@ def autotune(
             # trace: tracer.shape and tracer.dtype are always concrete.
             with jax.ensure_compile_time_eval():
                 dummy_args = jax.tree.map(
-                    lambda x: jnp.empty(x.shape, x.dtype) if hasattr(x, "shape") and hasattr(x, "dtype") else x,
+                    lambda x: jnp.empty(x.shape, x.dtype)  # type: ignore[reportUnknownLambdaType]
+                    if hasattr(x, "shape") and hasattr(x, "dtype")
+                    else x,
                     args,
                 )
                 dummy_kw = {
-                    k: jnp.empty(v.shape, v.dtype) if hasattr(v, "shape") and hasattr(v, "dtype") else v
+                    k: jnp.empty(v.shape, v.dtype)
+                    if hasattr(v, "shape") and hasattr(v, "dtype")
+                    else v
                     for k, v in kw.items()
                 }
 
@@ -188,7 +192,9 @@ def autotune(
                     best_time = median
                     best_config = cfg
 
-            _cache.save_best(fn_name, device_name, key_values, _encode(best_config), best_time)
+            _cache.save_best(
+                fn_name, device_name, key_values, _encode(best_config), best_time
+            )
 
             # Call fn with the original args + best config as first positional.
             # When inside a jit trace this is the only call that lands in the jaxpr.
