@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Write(/Users/jonkhler/dev/python/tonno/**)",
+      "Edit(/Users/jonkhler/dev/python/tonno/**)"
+    ]
+  }
+}

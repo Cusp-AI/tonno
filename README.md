@@ -15,136 +15,87 @@ pip install tonno          # or: uv add tonno
 
 ## Usage
 
-### 1. Define a config type
-
-Use a `NamedTuple` — hashable, fully typed, JSON-serialisable out of the box:
-
-```python
-from typing import NamedTuple
-
-class GemmConfig(NamedTuple):
-    bm: int  # output tile rows
-    bn: int  # output tile cols
-```
-
-### 2. Decorate your Pallas kernel
-
-The config is the **first positional argument**. Autotune injects it; callers never
-pass it directly. Key kwargs identify the problem shape and are used as the cache key.
+Stack `@autotune` on top of `@jax.jit`. The tunable parameters (keys of each config
+dict) must be declared as `static_argnames` in the `jax.jit` call and have defaults
+in the function signature — autotune injects the best values at call time.
 
 ```python
-from jax.experimental import pallas as pl
+import jax
 from tonno import autotune
 
-@autotune(
-    configs=[
-        GemmConfig(bm=16, bn=64),
-        GemmConfig(bm=32, bn=128),
-        GemmConfig(bm=64, bn=128),
-    ],
-    key=["M", "K", "N"],
-)
-def matmul(
-    cfg: GemmConfig,
-    a: jax.Array,
-    b: jax.Array,
-    *,
-    M: int | None = None,   # key param — must have a default
-    K: int | None = None,
-    N: int | None = None,
-) -> jax.Array:
-    # cfg.bm / cfg.bn are concrete ints at JIT compile time (static_argnums=0)
-    # Derive grid from array shapes, not from key params (those are popped)
-    return pl.pallas_call(
-        lambda a_ref, b_ref, c_ref: ...,
-        out_shape=jax.ShapeDtypeStruct((a.shape[0], b.shape[1]), a.dtype),
-        grid=(a.shape[0] // cfg.bm, b.shape[1] // cfg.bn),
-        ...
-    )(a, b)
+@autotune(configs=[
+    {"BM": 32, "BN": 64},
+    {"BM": 64, "BN": 128},
+])
+@jax.jit(static_argnames=["BM", "BN"])
+def matmul(a: jax.Array, b: jax.Array, BM: int = 32, BN: int = 64) -> jax.Array:
+    # BM / BN are concrete ints at compile time (static_argnames)
+    return pallas_matmul(a, b, BM=BM, BN=BN)
 ```
 
-### 3. Call it
+### Calling it
 
 ```python
 # First call: sweeps all configs, compiles in parallel, times sequentially,
-# writes the best GemmConfig to .tonno-cache/matmul.json
-c = matmul(a, b, M=4096, K=4096, N=4096)
+# writes the winner to .tonno-cache/matmul.json
+c = matmul(a, b)
 
-# Subsequent calls with the same (M, K, N) on the same device: cache hit,
+# Subsequent calls with the same input shapes on the same device: cache hit,
 # no sweep, runs immediately with the best config
-c = matmul(a, b, M=4096, K=4096, N=4096)
+c = matmul(a, b)
+
+# Explicit override — bypass autotune entirely
+c = matmul(a, b, BM=16, BN=32)
 ```
 
-The cache is per-device (`H100-80GB`, `TPU-v4`, `cpu`, …) so configs transfer
-correctly across runs on the same hardware.
+The cache key is derived from the input shapes and dtypes — exactly the same
+information `jax.jit` uses to decide whether to recompile. No explicit `key=`
+parameter needed.
+
+### Non-tunable static args
+
+If your kernel has static args beyond the tunable ones, declare them in `jax.jit`
+as usual. They are automatically part of the cache key:
+
+```python
+@autotune(configs=[{"BM": 32}, {"BM": 64}])
+@jax.jit(static_argnames=["BM", "transpose"])
+def matmul(a: jax.Array, b: jax.Array, transpose: bool = False, BM: int = 32) -> jax.Array:
+    ...
+```
 
 ## How it works
 
-1. **On first call** (cache miss): dummy inputs are built from the args' shapes/dtypes.
-   All configs are compiled in parallel via `ThreadPoolExecutor` (XLA compilation is
-   CPU-bound). Each compiled artifact is then timed sequentially on the dummy inputs
-   for accurate device timing. The winner is written to `.tonno-cache/<fn>.json`.
+1. **On first call** (cache miss): dummy inputs are built from the args' shapes/dtypes
+   via `jax.ensure_compile_time_eval`. All configs are compiled in parallel via
+   `ThreadPoolExecutor` (XLA compilation is CPU-bound). Each compiled artifact is then
+   timed sequentially for accurate device timing. The winner is written to
+   `.tonno-cache/<fn>.json`.
 
 2. **On subsequent calls** (cache hit): the best config is loaded from disk and
-   injected as `static_argnums=0`. JAX's own compilation cache takes over from there.
+   injected as static kwargs. JAX's own compilation cache takes over from there.
 
-3. **Inside `jax.jit`**: the sweep runs as a side channel during the first trace
-   (via `jax.ensure_compile_time_eval`), then the winning config is baked into the
-   jaxpr as a compile-time static.
-
-## Config types
-
-Any **hashable** type works. `NamedTuple` is recommended because it is:
-- Hashable → required by `static_argnums`
-- Typed → `cfg.bm: int`, not `cfg.bm: int | float | str | bool`
-- JSON-serialisable natively (tuple → list; default decoder reconstructs via `T(*data)`)
-
-```python
-# NamedTuple — recommended
-class KC(NamedTuple):
-    bm: int
-    bk: int
-
-# frozen dataclass — works with explicit encode/decode
-from dataclasses import dataclass
-import dataclasses
-
-@dataclass(frozen=True)
-class KC:
-    bm: int
-    bk: int
-
-@autotune(
-    configs=[KC(32, 64), KC(64, 32)],
-    key=["N"],
-    encode=dataclasses.asdict,
-    decode=lambda d: KC(**d),
-)
-def kernel(cfg: KC, x, *, N=None): ...
-```
+3. **Inside `jax.jit` / `jax.grad` / `jax.vmap`**: the sweep runs as a side channel
+   during the first trace, then the winning config is baked into the jaxpr as a
+   compile-time constant.
 
 ## API reference
 
 ```python
 autotune(
-    configs: Iterable[_C],          # configs to sweep, must be hashable
-    key: Sequence[str],             # kwargs naming the problem shape
+    configs: list[dict[str, Any]],  # configs to sweep; all dicts must share keys
     *,
-    num_warmup: int = 1,            # warmup iterations before timing
-    num_timing: int = 3,            # timed iterations (median used)
-    encode: Callable | None = None, # config → JSON-serialisable (default: identity)
-    decode: Callable | None = None, # JSON-loaded → config (default: T(*data))
+    num_warmup: int = 1,            # warmup calls per config after compilation
+    num_timing: int = 3,            # timed calls per config (median used)
 )
 ```
 
-**Rules for the decorated function:**
+**Contract:**
 
-- Config is the **first positional argument**, typed as `_C`.
-- Key params must have a **default value** (`N: int | None = None`) — they are
-  popped by autotune and never forwarded to the function body.
-- Derive Pallas grids from **array shapes** (`a.shape[0] // cfg.bm`), not from
-  key params (which are `None` inside the function).
-- All configs must have the **same pytree structure** (same type, same fields).
+- `@autotune` must wrap a `@jax.jit`-decorated function.
+- The tunable param keys must appear in `static_argnames` of the `jax.jit` call.
+- Tunable params must have defaults in the function signature.
+- Config values must be JSON-serialisable (`int`, `float`, `str`, `bool`).
 
 ## Cache
 
@@ -154,10 +105,10 @@ The file is human-readable JSON; you can inspect or delete entries manually.
 ```json
 {
   "NVIDIA H100 80GB": {
-    "{\"M\":4096,\"K\":4096,\"N\":4096}": {
-      "config": [64, 128],
+    "{\"__arg0\":{\"dtype\":\"float32\",\"shape\":[4096,4096]}, ...}": {
+      "config": {"BM": 64, "BN": 128},
       "time_ms": 0.312,
-      "key_values": {"M": 4096, "K": 4096, "N": 4096}
+      "key_values": {...}
     }
   }
 }
