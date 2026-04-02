@@ -18,6 +18,7 @@ Run on CPU (interpret mode, for correctness verification):
 Run on GPU (real autotuning):
     XLA_FLAGS=--xla_gpu_enable_custom_fusions=false python examples/matmul.py
 """
+
 from typing import NamedTuple
 
 import jax
