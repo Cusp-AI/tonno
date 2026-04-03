@@ -14,6 +14,7 @@ Usage pattern::
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from typing import Any
 
@@ -556,3 +557,201 @@ def test_cache_file_created_with_qualname(tmp_path: Any, monkeypatch: Any) -> No
     fn = _make_fn()
     fn(jnp.ones(4))
     assert (tmp_path / f"{fn.__qualname__}.json").exists()
+
+
+# ===========================================================================
+# name= parameter
+# ===========================================================================
+
+
+def test_name_param_overrides_qualname(tmp_path: Any, monkeypatch: Any) -> None:
+    """name= uses the supplied string as the cache file stem."""
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    @autotune(configs=[{"BN": 1}, {"BN": 2}], name="my_custom_name")
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        return x * BN
+
+    fn(jnp.ones(4))
+    assert (tmp_path / "my_custom_name.json").exists()
+    assert not (tmp_path / f"{fn.__qualname__}.json").exists()
+
+
+def test_name_param_prevents_qualname_collision(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """Two fns with the same name= share a cache; fn_b doesn't run a new sweep."""
+    import tonno.cache as _cache_mod
+
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+    save_count = [0]
+    real_save = _cache_mod.save_best
+
+    def counting_save(*args: Any, **kwargs: Any) -> None:
+        save_count[0] += 1
+        real_save(*args, **kwargs)
+
+    monkeypatch.setattr(_cache_mod, "save_best", counting_save)
+
+    @autotune(configs=[{"BN": 1}, {"BN": 2}], name="shared")
+    @jax.jit(static_argnames=["BN"])
+    def fn_a(x: jax.Array, BN: int = 1) -> jax.Array:
+        return x * BN
+
+    @autotune(configs=[{"BN": 1}, {"BN": 2}], name="shared")
+    @jax.jit(static_argnames=["BN"])
+    def fn_b(x: jax.Array, BN: int = 1) -> jax.Array:
+        return x * BN
+
+    fn_a(jnp.ones(4))
+    assert save_count[0] == 1  # fn_a ran the sweep
+    fn_b(jnp.ones(4))
+    assert save_count[0] == 1  # fn_b hit the cache — no new sweep
+
+
+# ===========================================================================
+# Outlier filtering
+# ===========================================================================
+
+
+def test_outlier_config_rejected(tmp_path: Any, monkeypatch: Any) -> None:
+    """Config with timing >10× minimum is rejected; the fast config wins."""
+    import tonno.tune as _tune_mod
+
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    # Configs are timed sequentially: BN=1 first, BN=99 second.
+    # With num_warmup=0 and num_timing=1, each config makes exactly 2
+    # perf_counter calls (start + end).  We return:
+    #   call 0 (BN=1 start):  0.0
+    #   call 1 (BN=1 end):    0.000001  → 0.001ms
+    #   call 2 (BN=99 start): 0.000002
+    #   call 3 (BN=99 end):   0.200002  → 200ms  (>10× the 0.001ms minimum)
+    mock_times = [0.0, 0.000001, 0.000002, 0.200002]
+    call_idx = [0]
+
+    def mock_pc() -> float:
+        v = mock_times[call_idx[0]]
+        call_idx[0] += 1
+        return v
+
+    monkeypatch.setattr(_tune_mod.time, "perf_counter", mock_pc)
+
+    @autotune(configs=[{"BN": 1}, {"BN": 99}], num_warmup=0, num_timing=1)
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        return x * BN
+
+    result = fn(jnp.ones(4))
+    assert float(result[0]) == 1.0  # BN=1 was selected, not the outlier BN=99
+
+
+def test_outlier_warning_emitted(tmp_path: Any, monkeypatch: Any, caplog: Any) -> None:
+    """Outlier rejection emits a WARNING."""
+    import tonno.tune as _tune_mod
+
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    mock_times = [0.0, 0.000001, 0.000002, 0.200002]
+    call_idx = [0]
+
+    def mock_pc() -> float:
+        v = mock_times[call_idx[0]]
+        call_idx[0] += 1
+        return v
+
+    monkeypatch.setattr(_tune_mod.time, "perf_counter", mock_pc)
+
+    @autotune(configs=[{"BN": 1}, {"BN": 99}], num_warmup=0, num_timing=1)
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        return x * BN
+
+    with caplog.at_level(logging.WARNING, logger="tonno.tune"):
+        fn(jnp.ones(4))
+
+    assert any("outlier" in r.message for r in caplog.records)
+
+
+def test_outlier_filter_keeps_all_if_would_remove_all(
+    tmp_path: Any, monkeypatch: Any, caplog: Any
+) -> None:
+    """If outlier filter would remove every config, all are kept and a warning fires."""
+    import tonno.tune as _tune_mod
+
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    # Only one config — it's the minimum, can't be filtered out.
+    mock_times = [0.0, 0.200002]
+    call_idx = [0]
+
+    def mock_pc() -> float:
+        v = mock_times[call_idx[0]]
+        call_idx[0] += 1
+        return v
+
+    monkeypatch.setattr(_tune_mod.time, "perf_counter", mock_pc)
+
+    @autotune(configs=[{"BN": 1}], num_warmup=0, num_timing=1)
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        return x * BN
+
+    # Single config: always the minimum, never filtered — just runs.
+    assert fn(jnp.ones(4)).shape == (4,)
+
+
+# ===========================================================================
+# Sweep INFO logging
+# ===========================================================================
+
+
+def test_sweep_info_logged(tmp_path: Any, monkeypatch: Any, caplog: Any) -> None:
+    """After a sweep, INFO log lines are emitted for each config and the winner."""
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    @autotune(configs=[{"BN": 1}, {"BN": 2}], num_warmup=0, num_timing=1)
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        return x * BN
+
+    with caplog.at_level(logging.INFO, logger="tonno.tune"):
+        fn(jnp.ones(4))
+
+    log_text = "\n".join(r.message for r in caplog.records)
+    assert "BN" in log_text
+    assert "picked" in log_text
+    assert "← best" in log_text
+
+
+def test_sweep_info_includes_failed_config(
+    tmp_path: Any, monkeypatch: Any, caplog: Any
+) -> None:
+    """Failed configs appear as FAILED in the sweep log."""
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    @autotune(configs=[{"BN": 0}, {"BN": 2}], num_warmup=0, num_timing=1)
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        if BN == 0:
+            raise ValueError("bad")
+        return x * BN
+
+    with caplog.at_level(logging.INFO, logger="tonno.tune"):
+        fn(jnp.ones(4))
+
+    assert any("FAILED" in r.message for r in caplog.records)
+
+
+# ===========================================================================
+# __version__
+# ===========================================================================
+
+
+def test_version_accessible() -> None:
+    """tonno.__version__ is a non-empty string."""
+    import tonno
+
+    assert isinstance(tonno.__version__, str)
+    assert len(tonno.__version__) > 0

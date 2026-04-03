@@ -21,6 +21,10 @@ from tonno.hardware import get_device_name
 _log = logging.getLogger(__name__)
 _F = TypeVar("_F", bound=Callable[..., Any])
 
+# Configs whose median timing exceeds this multiple of the minimum are treated
+# as outliers (e.g. compilation overhead leaking into timing) and dropped.
+_OUTLIER_FACTOR = 10.0
+
 
 def _make_cache_key(
     args: tuple[Any, ...],
@@ -51,6 +55,7 @@ def _make_cache_key(
 def autotune(
     configs: list[dict[str, Any]],
     *,
+    name: str | None = None,
     num_warmup: int = 1,
     num_timing: int = 3,
 ) -> Callable[[_F], _F]:
@@ -79,6 +84,9 @@ def autotune(
         configs: Non-empty list of dicts mapping tunable kwarg names to candidate
                  values.  All dicts must have identical keys.  Values must be
                  JSON-serialisable (int, float, str, bool).
+        name: Optional cache key name.  Defaults to ``fn.__qualname__``.  Set this
+              explicitly to avoid collisions when two functions share a qualname
+              (e.g. both defined as a local ``_tuned_fwd`` in different modules).
         num_warmup: Warmup calls per config after compilation.  Default 1.
         num_timing: Timed calls per config; median elapsed time is used.  Default 3.
     """
@@ -112,7 +120,7 @@ def autotune(
                 f"    def fn(...): ..."
             )
 
-        fn_name = fn.__qualname__
+        fn_name = name if name is not None else fn.__qualname__
 
         # Validate tunable params against the underlying function's signature.
         underlying = getattr(fn, "__wrapped__", None)
@@ -172,7 +180,10 @@ def autotune(
                     return None
                 except Exception as e:
                     _log.warning(
-                        "autotune: config %s failed to compile: %s — skipping", cfg, e
+                        "autotune %s: config %s failed to compile: %s — skipping",
+                        fn_name,
+                        cfg,
+                        e,
                     )
                     return e
 
@@ -180,41 +191,84 @@ def autotune(
                 compile_errors = list(pool.map(_try_compile, configs))
 
             # Time each successfully-compiled config sequentially.
-            best_config: dict[str, Any] | None = None
-            best_time = float("inf")
+            timings: list[tuple[dict[str, Any], float]] = []
 
             for cfg, err in zip(configs, compile_errors):
                 if err is not None:
-                    continue  # compilation failed — skip
+                    continue
                 try:
                     for _ in range(num_warmup):
                         jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
-                    times = []
+                    t_samples = []
                     for _ in range(num_timing):
                         t0 = time.perf_counter()
                         jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
-                        times.append((time.perf_counter() - t0) * 1000)
-                    median = sorted(times)[len(times) // 2]
-                    if median < best_time:
-                        best_time = median
-                        best_config = cfg
+                        t_samples.append((time.perf_counter() - t0) * 1000)
+                    timings.append((cfg, sorted(t_samples)[len(t_samples) // 2]))
                 except Exception as e:
                     _log.warning(
-                        "autotune: config %s failed during timing: %s — skipping",
+                        "autotune %s: config %s failed during timing: %s — skipping",
+                        fn_name,
                         cfg,
                         e,
                     )
-                    continue
 
-            if best_config is None:
+            if not timings:
                 failed_msgs = "\n".join(
                     f"  {cfg}: {err}"
                     for cfg, err in zip(configs, compile_errors)
                     if err is not None
                 )
                 raise RuntimeError(
-                    f"All {len(configs)} configs failed to compile or run.\n{failed_msgs}"
+                    f"All {len(configs)} configs failed to compile or run.\n"
+                    f"{failed_msgs}"
                 )
+
+            # Outlier filtering: drop configs whose median time exceeds
+            # _OUTLIER_FACTOR × the minimum.  This rejects configs where
+            # compilation overhead leaks into timing (e.g. JAX Pallas soft
+            # failures that compile without raising but run anomalously slow).
+            min_time = min(t for _, t in timings)
+            valid = [(cfg, t) for cfg, t in timings if t <= _OUTLIER_FACTOR * min_time]
+            if len(valid) < len(timings):
+                for cfg, t in timings:
+                    if t > _OUTLIER_FACTOR * min_time:
+                        _log.warning(
+                            "autotune %s: config %s rejected as outlier "
+                            "(%.3fms > %.0f× min %.3fms)",
+                            fn_name,
+                            cfg,
+                            t,
+                            _OUTLIER_FACTOR,
+                            min_time,
+                        )
+                if not valid:
+                    _log.warning(
+                        "autotune %s: outlier filter would remove all configs — keeping all",
+                        fn_name,
+                    )
+                    valid = timings
+
+            best_config, best_time = min(valid, key=lambda x: x[1])
+
+            # Log sweep results at INFO level.
+            failed_set = {
+                id(cfg) for cfg, err in zip(configs, compile_errors) if err is not None
+            }
+            for cfg in configs:
+                if id(cfg) in failed_set:
+                    _log.info("autotune %s:  %s  FAILED", fn_name, cfg)
+                else:
+                    t = next(t for c, t in timings if c is cfg)
+                    marker = " ← best" if cfg is best_config else ""
+                    _log.info("autotune %s:  %s  %.3fms%s", fn_name, cfg, t, marker)
+            _log.info(
+                "autotune %s: picked %s (%.3fms, device=%s)",
+                fn_name,
+                best_config,
+                best_time,
+                device_name,
+            )
 
             _cache.save_best(fn_name, device_name, key_values, best_config, best_time)
             return fn(*args, **kwargs, **best_config)
