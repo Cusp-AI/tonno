@@ -755,3 +755,44 @@ def test_version_accessible() -> None:
 
     assert isinstance(tonno.__version__, str)
     assert len(tonno.__version__) > 0
+
+
+# ===========================================================================
+# Traced-call sweep fallback
+# ===========================================================================
+
+
+def test_traced_cold_cache_uses_first_config_and_warns(
+    tmp_path: Any, monkeypatch: Any, caplog: Any
+) -> None:
+    """Cache miss inside a JAX trace falls back to configs[0] with a WARNING."""
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    @autotune(configs=[{"BN": 3}, {"BN": 7}])
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        return jnp.sum(x * BN)
+
+    # Cold cache inside jax.grad — must not crash and must use configs[0].
+    with caplog.at_level(logging.WARNING, logger="tonno.tune"):
+        g = jax.grad(fn)(jnp.ones(4))
+
+    assert g.shape == (4,)
+    assert jnp.allclose(g, jnp.full(4, 3.0))  # configs[0] = {"BN": 3}
+    assert any("JAX trace" in r.message for r in caplog.records)
+
+
+def test_eager_sweep_runs_with_real_arrays(tmp_path: Any, monkeypatch: Any) -> None:
+    """Eager cold-cache call: sweep runs, all configs tried, best cached."""
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+    seen: list[int] = []
+
+    @autotune(configs=[{"BN": 1}, {"BN": 2}, {"BN": 3}])
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        seen.append(BN)
+        return x * BN
+
+    fn(jnp.ones(4))
+    assert set(seen) >= {1, 2, 3}  # all configs tried
+    assert (tmp_path / f"{fn.__qualname__}.json").exists()  # cache written
