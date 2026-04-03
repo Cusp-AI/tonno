@@ -8,11 +8,10 @@ import inspect
 import logging
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
 import jax
-import jax.numpy as jnp
+import jax.core
 
 from tonno import cache as _cache
 from tonno.cache import MISSING
@@ -153,30 +152,35 @@ def autotune(
             if raw is not MISSING:
                 return fn(*args, **kwargs, **raw)
 
-            # Build concrete dummy inputs so the sweep is safe inside any JAX
-            # trace context (jax.grad, jax.vmap, jax.lax.scan, etc.).
-            # ensure_compile_time_eval makes jnp.empty concrete even when args
-            # are abstract tracers — shape and dtype are always concrete.
-            with jax.ensure_compile_time_eval():
-                dummy_args = jax.tree.map(
-                    lambda a: jnp.empty(a.shape, a.dtype)  # type: ignore[reportUnknownLambdaType]
-                    if hasattr(a, "shape") and hasattr(a, "dtype")
-                    else a,
-                    args,
+            # Detect whether we're inside a JAX trace (jax.grad, vmap, scan, …).
+            # Inside a trace the args are abstract Tracers — running the sweep
+            # in that context triggers JAX thread-safety bugs in Pallas kernels
+            # (broken imports in the abstract-eval path when called from
+            # ThreadPoolExecutor threads).  Skip the sweep and fall back to the
+            # first config, emitting a warning so the user knows to pre-warm.
+            in_trace = any(
+                isinstance(leaf, jax.core.Tracer)
+                for leaf in jax.tree.leaves((args, kwargs))
+            )
+            if in_trace:
+                _log.warning(
+                    "autotune %s: cache miss inside JAX trace "
+                    "(jax.grad / vmap / scan). Using configs[0] = %s. "
+                    "Call the function once eagerly to sweep and cache the "
+                    "best config before using inside a JAX transformation.",
+                    fn_name,
+                    configs[0],
                 )
-                dummy_kw = {
-                    k: jnp.empty(v.shape, v.dtype)
-                    if hasattr(v, "shape") and hasattr(v, "dtype")
-                    else v
-                    for k, v in kwargs.items()
-                }
+                return fn(*args, **kwargs, **configs[0])
 
-            # Compile all configs in parallel — XLA is CPU-bound and thread-safe.
-            # Return the exception (not raise it) so one bad config doesn't abort
-            # the whole sweep and doesn't silently produce misleading timings.
+            # Eager path — compile and time with the real arrays.
+            # Using concrete arrays (rather than jnp.empty dummies) avoids
+            # the JAX Pallas abstract-eval bug that manifests when compilation
+            # runs inside ThreadPoolExecutor threads.  Sequential compilation
+            # in the main thread is the safe, correct approach.
             def _try_compile(cfg: dict[str, Any]) -> Exception | None:
                 try:
-                    jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
+                    jax.block_until_ready(fn(*args, **kwargs, **cfg))
                     return None
                 except Exception as e:
                     _log.warning(
@@ -187,8 +191,7 @@ def autotune(
                     )
                     return e
 
-            with ThreadPoolExecutor() as pool:
-                compile_errors = list(pool.map(_try_compile, configs))
+            compile_errors = [_try_compile(cfg) for cfg in configs]
 
             # Time each successfully-compiled config sequentially.
             timings: list[tuple[dict[str, Any], float]] = []
@@ -198,11 +201,11 @@ def autotune(
                     continue
                 try:
                     for _ in range(num_warmup):
-                        jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
+                        jax.block_until_ready(fn(*args, **kwargs, **cfg))
                     t_samples = []
                     for _ in range(num_timing):
                         t0 = time.perf_counter()
-                        jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
+                        jax.block_until_ready(fn(*args, **kwargs, **cfg))
                         t_samples.append((time.perf_counter() - t0) * 1000)
                     timings.append((cfg, sorted(t_samples)[len(t_samples) // 2]))
                 except Exception as e:
