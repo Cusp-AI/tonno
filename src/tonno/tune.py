@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,7 @@ from tonno import cache as _cache
 from tonno.cache import MISSING
 from tonno.hardware import get_device_name
 
+_log = logging.getLogger(__name__)
 _F = TypeVar("_F", bound=Callable[..., Any])
 
 
@@ -162,28 +164,57 @@ def autotune(
                 }
 
             # Compile all configs in parallel — XLA is CPU-bound and thread-safe.
-            def _compile(cfg: dict[str, Any]) -> None:
-                jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
+            # Return the exception (not raise it) so one bad config doesn't abort
+            # the whole sweep and doesn't silently produce misleading timings.
+            def _try_compile(cfg: dict[str, Any]) -> Exception | None:
+                try:
+                    jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
+                    return None
+                except Exception as e:
+                    _log.warning(
+                        "autotune: config %s failed to compile: %s — skipping", cfg, e
+                    )
+                    return e
 
             with ThreadPoolExecutor() as pool:
-                list(pool.map(_compile, configs))
+                compile_errors = list(pool.map(_try_compile, configs))
 
-            # Time each config sequentially for accurate device measurements.
-            best_config = configs[0]
+            # Time each successfully-compiled config sequentially.
+            best_config: dict[str, Any] | None = None
             best_time = float("inf")
 
-            for cfg in configs:
-                for _ in range(num_warmup):
-                    jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
-                times = []
-                for _ in range(num_timing):
-                    t0 = time.perf_counter()
-                    jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
-                    times.append((time.perf_counter() - t0) * 1000)
-                median = sorted(times)[len(times) // 2]
-                if median < best_time:
-                    best_time = median
-                    best_config = cfg
+            for cfg, err in zip(configs, compile_errors):
+                if err is not None:
+                    continue  # compilation failed — skip
+                try:
+                    for _ in range(num_warmup):
+                        jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
+                    times = []
+                    for _ in range(num_timing):
+                        t0 = time.perf_counter()
+                        jax.block_until_ready(fn(*dummy_args, **dummy_kw, **cfg))
+                        times.append((time.perf_counter() - t0) * 1000)
+                    median = sorted(times)[len(times) // 2]
+                    if median < best_time:
+                        best_time = median
+                        best_config = cfg
+                except Exception as e:
+                    _log.warning(
+                        "autotune: config %s failed during timing: %s — skipping",
+                        cfg,
+                        e,
+                    )
+                    continue
+
+            if best_config is None:
+                failed_msgs = "\n".join(
+                    f"  {cfg}: {err}"
+                    for cfg, err in zip(configs, compile_errors)
+                    if err is not None
+                )
+                raise RuntimeError(
+                    f"All {len(configs)} configs failed to compile or run.\n{failed_msgs}"
+                )
 
             _cache.save_best(fn_name, device_name, key_values, best_config, best_time)
             return fn(*args, **kwargs, **best_config)

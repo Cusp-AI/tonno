@@ -444,6 +444,60 @@ def test_second_order_grad(tmp_path: Any, monkeypatch: Any) -> None:
 
 
 # ===========================================================================
+# Partial compilation failures
+# ===========================================================================
+
+
+def test_failing_config_skipped_good_config_wins(
+    tmp_path: Any, monkeypatch: Any
+) -> None:
+    """A config that raises during compilation is skipped; the good one wins."""
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    @autotune(configs=[{"BN": 0}, {"BN": 2}])  # BN=0 will raise in the kernel
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        if BN == 0:
+            raise ValueError("BN=0 is invalid")
+        return x * BN
+
+    result = fn(jnp.ones(4))
+    assert jnp.allclose(result, jnp.full(4, 2.0))
+
+
+def test_all_configs_fail_raises_runtime_error(tmp_path: Any, monkeypatch: Any) -> None:
+    """If every config fails to compile, RuntimeError is raised with details."""
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    @autotune(configs=[{"BN": 0}, {"BN": -1}])
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        raise ValueError(f"BN={BN} always fails")
+
+    with pytest.raises(RuntimeError, match="configs failed"):
+        fn(jnp.ones(4))
+
+
+def test_failing_config_not_cached(tmp_path: Any, monkeypatch: Any) -> None:
+    """A sweep that skips a failing config caches only the passing config's result."""
+    monkeypatch.setenv("TONNO_CACHE_DIR", str(tmp_path))
+
+    @autotune(configs=[{"BN": 0}, {"BN": 3}])
+    @jax.jit(static_argnames=["BN"])
+    def fn(x: jax.Array, BN: int = 1) -> jax.Array:
+        if BN == 0:
+            raise ValueError("bad config")
+        return x * BN
+
+    fn(jnp.ones(4))
+    import json as _json
+
+    data = _json.loads((tmp_path / f"{fn.__qualname__}.json").read_text())
+    cached = next(iter(next(iter(data.values())).values()))["config"]
+    assert cached == {"BN": 3}
+
+
+# ===========================================================================
 # Cache edge cases
 # ===========================================================================
 
